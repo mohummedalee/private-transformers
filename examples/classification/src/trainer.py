@@ -40,9 +40,12 @@ from transformers.integrations import (
     is_tensorboard_available,
     is_wandb_available,
 )
+import wandb
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 from transformers.trainer_callback import (
+    PrinterCallback,
+    CallbackHandler,
     DefaultFlowCallback,
     ProgressCallback,
 )
@@ -91,7 +94,8 @@ if is_tensorboard_available():
     DEFAULT_CALLBACKS.append(TensorBoardCallback)
 
 if is_wandb_available():
-    from transformers.integrations import WandbCallback
+    from transformers.integrations import WandbCallback    
+    print(f">> DEBUG: wandb_available!")
 
     DEFAULT_CALLBACKS.append(WandbCallback)
 
@@ -125,8 +129,10 @@ def default_dev_objective(metrics):
         return metrics["eval_mcc"]
     elif "eval_pearson" in metrics:
         return metrics["eval_pearson"]
-    elif "eval_acc" in metrics:
-        return metrics["eval_acc"]
+    elif "eval_accuracy" in metrics:
+        return metrics["eval_accuracy"]
+    elif "eval_loss" in metrics:
+        return metrics["eval_loss"]
 
     raise Exception("No metric founded for {}".format(metrics))
 
@@ -139,7 +145,7 @@ def default_dev_objective_key(metrics):
         "eval_f1",
         "eval_mcc",
         "eval_pearson",
-        "eval_acc"
+        "eval_accuracy"
     )
     for key in keys:
         if key in metrics:
@@ -152,12 +158,20 @@ class Trainer(transformers.Trainer):
     Adding some functions based on Transformers' Trainer class.
     """
 
-    def __init__(self, model_args=None, privacy_args=None, auxiliary_args=None, **kwargs):
+    def __init__(self, model_args=None, privacy_args=None, tracker_obj=None, auxiliary_args=None, **kwargs):
         super(Trainer, self).__init__(**kwargs)
         self.privacy_args = privacy_args
         self.model_args = model_args
         self.auxiliary_args = auxiliary_args
         self.scaler = torch.cuda.amp.GradScaler(init_scale=128)
+        # --- mohummedalee: will pass wandb object to do custom logging
+        self.tracker_obj = tracker_obj
+        # default_callbacks = DEFAULT_CALLBACKS
+        # callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
+        # self.callback_handler = CallbackHandler(
+        #     callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler
+        # )
+        # self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
     # --- lxuechen: Not sure why v4.10.0 removed this function...
     def is_local_master(self) -> bool:
@@ -243,24 +257,28 @@ class Trainer(transformers.Trainer):
             num_train_epochs=num_train_epochs
         )
 
-    def train(self, model_path=None, dev_objective=None, dev_objective_key=None):
+    def train(self, model_path=None, dev_objective="eval_accuracy", dev_objective_key=None):
         """
         Main training entry point.
 
         The training logic is directly borrowed from transformers.Trainer (version 3.0.2).
         Add early stopping.
         """
-        if self.args.local_rank != -1 or self.args.n_gpu > 1:
-            raise ValueError("Multi-gpu and distributed training is currently not supported.")
-        if self.args.fp16:
-            raise ValueError("Mixed-precision training is currently not supported.")
+        print(f'>> DEBUG self.args.local_rank: {self.args.local_rank}; self.args.n_gpu: {self.args.n_gpu}; self.auxiliary_args: {self.auxiliary_args}')
+        # --- mohummedalee: skipping these checks since Trainer generally supports
+        # if self.args.local_rank != -1 or self.args.n_gpu > 1:
+        #     raise ValueError("Multi-gpu and distributed training is currently not supported.")
+        # if self.args.fp16:
+        #     raise ValueError("Mixed-precision training is currently not supported.")
 
         self.args: TrainingArguments
 
+        # --- mohummedalee: simplifying dev_objective to the default metric "eval_accuracy", can add more later if needed
         self.best_dir = None
         self.objective = -float("inf")
-        self.dev_objective = default_dev_objective if dev_objective is None else dev_objective
-        self.dev_objective_key = default_dev_objective_key if dev_objective_key is None else dev_objective_key
+        # self.dev_objective = default_dev_objective if dev_objective is None else dev_objective
+        self.dev_objective = dev_objective
+        # self.dev_objective_key = default_dev_objective_key if dev_objective_key is None else dev_objective_key
         # --- lxuechen: Don't use self.state.log_history. Given implementation so convoluted...
         self.log_history = []
         # ---
@@ -349,7 +367,7 @@ class Trainer(transformers.Trainer):
         # --- low rank analysis project ---
         callback = None  # Default; don't store gradients or perform projection.
 
-        if self.auxiliary_args.orthogonal_projection_path is not None:
+        if self.auxiliary_args and self.auxiliary_args.orthogonal_projection_path is not None:
             state_dicts = torch.load(self.auxiliary_args.orthogonal_projection_path)
             # Kept on CPU during most of the time of training.
             orthogonal_projection = state_dicts.get("eigenvectors")[:, :self.auxiliary_args.orthogonal_projection_rank]
@@ -379,7 +397,7 @@ class Trainer(transformers.Trainer):
                 for (_, param), grad in utils.zip_(named_params, grads):
                     param.summed_grad = grad
 
-        if self.auxiliary_args.store_grads:
+        if self.auxiliary_args and self.auxiliary_args.store_grads:
             store_grads_dir = utils.join(self.args.output_dir, 'grad_trajectory')
             utils.makedirs(store_grads_dir, exist_ok=True)
         else:
@@ -417,6 +435,9 @@ class Trainer(transformers.Trainer):
                 epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=False)
 
             for step, inputs in enumerate(epoch_iterator):
+                # count steps here
+                self.global_step += 1
+                self.epoch = epoch + (step + 1) / len(epoch_iterator)
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
@@ -455,9 +476,17 @@ class Trainer(transformers.Trainer):
 
                     scheduler.step()
                     model.zero_grad(set_to_none=True)
-                    self.global_step += 1
-                    self.epoch = epoch + (step + 1) / len(epoch_iterator)
+                    # --- mohummedalee: moved these outside to the beginning of loop; i believe it's a bug that leads to no tracking
+                    # self.global_step += 1
+                    # self.epoch = epoch + (step + 1) / len(epoch_iterator)
+                    # ---
 
+                    # print(f"""
+                    # >> DEBUG: self.args.evaluation_strategy: {self.args.evaluation_strategy};
+                    # first_cond: {self.args.evaluation_strategy in (IntervalStrategy.STEPS, EvaluationStrategy.STEPS)};
+                    # self.global_step: {self.global_step}; self.args.eval_steps: {self.args.eval_steps};
+                    # mod: {self.global_step % self.args.eval_steps}
+                    # """)
                     metrics = None
                     if (
                         self.args.evaluation_strategy in (IntervalStrategy.STEPS, EvaluationStrategy.STEPS) and
@@ -578,15 +607,18 @@ class Trainer(transformers.Trainer):
     ):
         # lxuechen: Defaults to use .eval_dataset, which is set to 'dev'.
         output = self.evaluate()
-        metrics = output.metrics
+        metrics = output.metrics        
 
-        objective = self.dev_objective(metrics)
-        objective_key = self.dev_objective_key(metrics)
+        # --- mohummedalee: I'm only tracking one metric across all experiments
+        # objective = self.dev_objective(metrics)
+        # objective_key = self.dev_objective_key(metrics)
+        objective = metrics[self.dev_objective]
+        # ---
 
         # --- lxuechen: Print the metrics in a pretty format.
         print('metrics: ')
         print(json.dumps(metrics, indent=4))
-        print(f'dev objective {objective_key}: {objective}')
+        # print(f'dev objective {objective_key}: {objective}')
         # ---
 
         if objective > self.objective:
@@ -595,7 +627,7 @@ class Trainer(transformers.Trainer):
             self.save_model(self.args.output_dir)
 
         # --- lxuechen: Combine logging and evaluation
-        logs = dict(dev=metrics)
+        logs = dict(dev=metrics)        
 
         tr_loss_scalar = tr_loss.item()
         logs["loss"] = (tr_loss_scalar - logging_loss_scalar) / self.args.logging_steps
@@ -617,71 +649,21 @@ class Trainer(transformers.Trainer):
 
         # Write to disk!
         utils.jdump(self.log_history, os.path.join(self.args.output_dir, 'log_history.json'))
-        # ---
-
-        # ---
-        # Evaluate gradient covariance spectrum for the dimension-dependence analysis project.
-        if self.auxiliary_args.eval_spectrum:
-            from ..spectrum import spectrum_utils
-
-            def loss_fn(batch, model):
-                batch = self._prepare_inputs(inputs=batch)
-                return self.compute_loss(
-                    model=model, inputs=batch, return_outputs=False, return_vector_loss=True
-                )
-
-            default_dtype = torch.get_default_dtype()
-            torch.set_default_dtype(torch.float64)  # Slow but accurate.
-            self.model.to(dtype=torch.float64)
-
-            spectrum_loader = DataLoader(
-                self.train_dataset,
-                batch_size=self.args.train_batch_size,
-                shuffle=False,  # Must not shuffle.
-                collate_fn=self.data_collator,
-                drop_last=self.args.dataloader_drop_last,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-
-            # No per-sample grads accumulated here, since `model.eval()` called internally.
-            spectrum_outputs = spectrum_utils.make_spectrum_lanczos(
-                loader=spectrum_loader,
-                model=self.model,
-                max_batches=self.auxiliary_args.max_spectrum_batches,
-                max_lanczos_iter=self.auxiliary_args.max_lanczos_iter,
-                loss_fn=loss_fn,
-                return_dict=True,
-                verbose=True,
-            )
-
-            state_dicts = {
-                key: value.cpu().float() if torch.is_tensor(value) else value
-                for key, value in spectrum_outputs.items()
-            }
-            utils.tsave(
-                state_dicts,
-                utils.join(self.args.output_dir, 'spectrum', f'global_step_{self.global_step:06d}.pt')
-            )
-
-            torch.set_default_dtype(default_dtype)
-            self.model.to(dtype=default_dtype)
-
-            del spectrum_outputs, state_dicts
-            gc.collect()
-            torch.cuda.empty_cache()
-        # ---
+        # ---        
+        # log to internet!        
+        if self.tracker_obj:
+            self.tracker_obj.log(logs)
 
         # ---
         # Store grad params.
-        state_dicts = dict()
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                state_dicts[name] = param.data.cpu().float()
-        utils.tsave(
-            state_dicts,
-            utils.join(self.args.output_dir, 'grad_params', f'global_step_{self.global_step:06d}.pt')
-        )
+        # state_dicts = dict()
+        # for name, param in self.model.named_parameters():
+        #     if param.requires_grad:
+        #         state_dicts[name] = param.data.cpu().float()
+        # utils.tsave(
+        #     state_dicts,
+        #     utils.join(self.args.output_dir, 'grad_params', f'global_step_{self.global_step:06d}.pt')
+        # )
         # ---
 
         return logging_loss_scalar
