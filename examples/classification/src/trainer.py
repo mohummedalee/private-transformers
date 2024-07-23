@@ -40,12 +40,9 @@ from transformers.integrations import (
     is_tensorboard_available,
     is_wandb_available,
 )
-import wandb
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-from transformers.trainer_callback import (
-    PrinterCallback,
-    CallbackHandler,
+from transformers.trainer_callback import (    
     DefaultFlowCallback,
     ProgressCallback,
 )
@@ -93,11 +90,10 @@ if is_tensorboard_available():
 
     DEFAULT_CALLBACKS.append(TensorBoardCallback)
 
-if is_wandb_available():
-    from transformers.integrations import WandbCallback    
-    print(f">> DEBUG: wandb_available!")
+# if is_wandb_available():
+#     from transformers.integrations import WandbCallback    
 
-    DEFAULT_CALLBACKS.append(WandbCallback)
+#     DEFAULT_CALLBACKS.append(WandbCallback)
 
 if is_comet_available():
     from transformers.integrations import CometCallback
@@ -158,20 +154,12 @@ class Trainer(transformers.Trainer):
     Adding some functions based on Transformers' Trainer class.
     """
 
-    def __init__(self, model_args=None, privacy_args=None, tracker_obj=None, auxiliary_args=None, **kwargs):
+    def __init__(self, model_args=None, privacy_args=None, auxiliary_args=None, **kwargs):
         super(Trainer, self).__init__(**kwargs)
         self.privacy_args = privacy_args
         self.model_args = model_args
         self.auxiliary_args = auxiliary_args
-        self.scaler = torch.cuda.amp.GradScaler(init_scale=128)
-        # --- mohummedalee: will pass wandb object to do custom logging
-        self.tracker_obj = tracker_obj
-        # default_callbacks = DEFAULT_CALLBACKS
-        # callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        # self.callback_handler = CallbackHandler(
-        #     callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler
-        # )
-        # self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.scaler = torch.cuda.amp.GradScaler(init_scale=128)        
 
     # --- lxuechen: Not sure why v4.10.0 removed this function...
     def is_local_master(self) -> bool:
@@ -491,7 +479,7 @@ class Trainer(transformers.Trainer):
                     if (
                         self.args.evaluation_strategy in (IntervalStrategy.STEPS, EvaluationStrategy.STEPS) and
                         self.global_step % self.args.eval_steps == 0
-                    ):
+                    ):                        
                         logging_loss_scalar = self.evaluate_and_log(
                             tr_loss=tr_loss,
                             logging_loss_scalar=logging_loss_scalar,
@@ -520,13 +508,13 @@ class Trainer(transformers.Trainer):
                 # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
                 xm.master_print(met.metrics_report())
 
-        if self.args.evaluate_after_training:
-            logger.info("Evaluate after training ends.")
-            self.evaluate_and_log(
-                tr_loss=tr_loss,
-                logging_loss_scalar=logging_loss_scalar,
-                scheduler=scheduler,
-            )
+        # if self.args.evaluate_after_training:
+        logger.info("Evaluating after training ends.")
+        self.evaluate_and_log(
+            tr_loss=tr_loss,
+            logging_loss_scalar=logging_loss_scalar,
+            scheduler=scheduler,
+        )
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(self.global_step, tr_loss / self.global_step, metrics=metrics), self.objective
@@ -604,7 +592,7 @@ class Trainer(transformers.Trainer):
         tr_loss,
         logging_loss_scalar,
         scheduler,
-    ):
+    ):        
         # lxuechen: Defaults to use .eval_dataset, which is set to 'dev'.
         output = self.evaluate()
         metrics = output.metrics        
@@ -649,10 +637,8 @@ class Trainer(transformers.Trainer):
 
         # Write to disk!
         utils.jdump(self.log_history, os.path.join(self.args.output_dir, 'log_history.json'))
-        # ---        
-        # log to internet!        
-        if self.tracker_obj:
-            self.tracker_obj.log(logs)
+        # ---
+        
 
         # ---
         # Store grad params.
